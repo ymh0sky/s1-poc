@@ -159,10 +159,15 @@ def run():
 if __name__ == "__main__":
     print(f"[SCHEDULER] Starting. Run interval: every {RUN_INTERVAL_HOURS}h")
     while True:
+        run_start = time.time()
         try:
             run()
         except Exception as e:
             print(f"[SCHEDULER-ERROR] Unhandled exception in run(): {e}")
-        next_run = datetime.now(timezone.utc) + timedelta(hours=RUN_INTERVAL_HOURS)
-        print(f"[SCHEDULER] Next run at {next_run.strftime('%Y-%m-%dT%H:%M:%SZ')}")
-        time.sleep(RUN_INTERVAL_HOURS * 3600)
+
+        elapsed   = time.time() - run_start
+        sleep_for = max(0, RUN_INTERVAL_HOURS * 3600 - elapsed)
+        next_run  = datetime.now(timezone.utc) + timedelta(seconds=sleep_for)
+        print(f"[SCHEDULER] Run took {elapsed:.0f}s. Sleeping {sleep_for:.0f}s. "
+              f"Next run at {next_run.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        time.sleep(sleep_for)
