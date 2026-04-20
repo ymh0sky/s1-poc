@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+requests
+boto3
+google-cloud-storage
+google-auth
+google-auth-httplib2
