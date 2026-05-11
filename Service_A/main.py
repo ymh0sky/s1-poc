@@ -43,7 +43,6 @@ class PairsRequest(BaseModel):
     start_date:      str
     end_date:        str | None = None
     exclusion_zones: list[list[list[float]]] | None = None
-    match_count:     int = 1
 
 class FetchRequest(BaseModel):
     # Trimmed product ID as output by /pairs (last _XXXX segment removed)
@@ -73,8 +72,8 @@ def build_exclusion_filter(exclusion_zones: list[list[list[float]]]) -> str:
 
 def query_odata_paginated(odata_filter: str, label: str, expand: str = "Locations") -> list:
     all_items = []
-    url = ODATA_URL
-    params = {
+    url       = ODATA_URL
+    params    = {
         "$filter":  odata_filter,
         "$orderby": "PublicationDate asc",
         "$top":     100,
@@ -99,32 +98,65 @@ def query_odata_paginated(odata_filter: str, label: str, expand: str = "Location
 
 
 def get_product_attributes(product_name: str) -> dict:
+    """
+    Fetch attributes needed for pairing validation from the OData catalogue.
+
+    Returns:
+        relative_orbit  – relativeOrbitNumber as str, or None
+        slice_number    – sliceNumber as str, or None
+        pass_direction  – 'ASCENDING' or 'DESCENDING', or None
+        sensing_end     – ContentDate/End ISO string, or None
+    """
     product_name_safe = product_name if product_name.endswith(".SAFE") else f"{product_name}.SAFE"
+    empty = {
+        "relative_orbit": None,
+        "slice_number":   None,
+        "pass_direction": None,
+        "sensing_end":    None,
+    }
     try:
         r = requests.get(
             ODATA_URL,
-            params={"$filter": f"Name eq '{product_name_safe}'", "$expand": "Attributes", "$top": 1},
-            timeout=30
+            params={
+                "$filter": f"Name eq '{product_name_safe}'",
+                "$expand": "Attributes",
+                "$top":    1,
+            },
+            timeout=30,
         )
         r.raise_for_status()
         items = r.json().get("value", [])
         if not items:
-            return {"relative_orbit": None, "slice_number": None}
+            return empty
 
-        attrs          = items[0].get("Attributes", [])
+        item           = items[0]
+        attrs          = item.get("Attributes", [])
         relative_orbit = None
         slice_number   = None
-        for attr in attrs:
-            if attr.get("Name") == "relativeOrbitNumber":
-                relative_orbit = str(attr.get("Value"))
-            elif attr.get("Name") == "sliceNumber":
-                slice_number = str(attr.get("Value"))
+        pass_direction = None
 
-        return {"relative_orbit": relative_orbit, "slice_number": slice_number}
+        for attr in attrs:
+            name = attr.get("Name")
+            val  = attr.get("Value")
+            if name == "relativeOrbitNumber":
+                relative_orbit = str(val)
+            elif name == "sliceNumber":
+                slice_number = str(val)
+            elif name == "orbitDirection":
+                pass_direction = str(val).upper()  # 'ASCENDING' | 'DESCENDING'
+
+        sensing_end = item.get("ContentDate", {}).get("End")
+
+        return {
+            "relative_orbit": relative_orbit,
+            "slice_number":   slice_number,
+            "pass_direction": pass_direction,
+            "sensing_end":    sensing_end,
+        }
 
     except Exception as e:
         print(f"    [ATTRS-ERROR] {product_name}: {e}")
-        return {"relative_orbit": None, "slice_number": None}
+        return empty
 
 
 def extract_s3_prefix(item: dict) -> str | None:
@@ -176,95 +208,284 @@ def resolve_s3_prefix_from_trimmed(trimmed_id: str) -> tuple[str | None, str | N
         print(f"[RESOLVE-ERROR] Exception resolving {trimmed_id}: {e}")
         return None, None
 
+# ---------------------------------------------------------------------------
+# PAIRING VALIDATION THRESHOLDS
+# ---------------------------------------------------------------------------
 
-def find_prior_acquisitions(
-    platform:       str,
+# Maximum allowed drift in sensing start time between a primary and its prior
+# acquisition on the same relative orbit. Sentinel-1 orbital repeat is frozen
+# to within ~2s cycle-to-cycle; 10s gives headroom for minor manoeuvres.
+MAX_SENSING_START_DELTA_S = 10
+
+# Maximum allowed difference in acquisition duration between primary and
+# secondary. Same slice = same burst count = same duration to within ~1s.
+# 2s gives headroom for timestamp rounding.
+MAX_SENSING_DURATION_DELTA_S = 2
+
+# Search window around the expected repeat time.
+PRIOR_WINDOW_MINUTES = 30
+
+# Sentinel-1A repeat cycle in days.
+REPEAT_DAYS = 12
+
+
+def find_prior_acquisition(
     relative_orbit: str,
     slice_number:   str,
+    pass_direction: str,
     sensing_start:  str,
-    count:          int
-) -> list:
-    REPEAT_DAYS    = 12
-    WINDOW_MINUTES = 30
+    sensing_end:    str,
+    footprint:      str,
+) -> str | None:
+    """
+    Find the prior S1A acquisition (12 days earlier) that is a valid InSAR
+    pair for the given primary product.
 
-    sensing_dt = datetime.fromisoformat(sensing_start.replace("Z", "+00:00"))
-    results    = []
+    Validation checks applied in order (cheapest first):
+      1. [OData filter]  Product type = IW_GRDH_1S
+      2. [OData filter]  Polarisation = VV&VH
+      3. [OData filter]  Platform     = S1A  (never mix S1A/S1B)
+      4. [OData filter]  Non-COG      (exclude IW_GRDH_1S-COG variants)
+      5. [OData filter]  Pass direction matches primary (ASCENDING/DESCENDING)
+      6. [OData filter]  Sensing start within ±PRIOR_WINDOW_MINUTES of expected repeat
+      7. [OData filter]  Spatial footprint intersects AOI
+      8. [In-memory]     Relative orbit number exact match
+      9. [In-memory]     Slice number exact match
+     10. [In-memory]     Sensing start delta ≤ MAX_SENSING_START_DELTA_S
+     11. [In-memory]     Sensing duration delta ≤ MAX_SENSING_DURATION_DELTA_S
+    """
+    sensing_dt         = datetime.fromisoformat(sensing_start.replace("Z", "+00:00"))
+    sensing_end_dt     = datetime.fromisoformat(sensing_end.replace("Z", "+00:00"))
+    primary_duration_s = (sensing_end_dt - sensing_dt).total_seconds()
 
-    for n in range(1, count + 1):
-        target_dt    = sensing_dt - timedelta(days=REPEAT_DAYS * n)
-        window_start = (target_dt - timedelta(minutes=WINDOW_MINUTES)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        window_end   = (target_dt + timedelta(minutes=WINDOW_MINUTES)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    target_dt    = sensing_dt - timedelta(days=REPEAT_DAYS)
+    window_start = (target_dt - timedelta(minutes=PRIOR_WINDOW_MINUTES)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    window_end   = (target_dt + timedelta(minutes=PRIOR_WINDOW_MINUTES)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        print(f"    [PRIOR-{n}] Window: {window_start} → {window_end} | orbit {relative_orbit} | slice {slice_number}")
+    print(
+        f"    [PRIOR] Searching | orbit={relative_orbit} slice={slice_number} "
+        f"pass={pass_direction} duration={primary_duration_s:.1f}s"
+    )
+    print(f"    [PRIOR] Window: {window_start} → {window_end}")
 
-        odata_filter = (
-            f"Collection/Name eq 'SENTINEL-1' and "
-            f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/Value eq 'IW_GRDH_1S') and "
-            f"contains(Name,'{platform}') and "
-            f"ContentDate/Start gt {window_start} and "
-            f"ContentDate/Start lt {window_end}"
+    odata_filter = (
+        f"Collection/Name eq 'SENTINEL-1' and "
+        # (1) product type — non-COG standard GRD
+        f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/Value eq 'IW_GRDH_1S') and "
+        # (2) polarisation
+        f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'polarisationChannels' and att/Value eq 'VV&VH') and "
+        # (3) platform — S1A only, never mix with S1B
+        f"contains(Name,'S1A') and "
+        # (4) exclude COG variants
+        f"not contains(Name,'-COG') and "
+        # (5) pass direction must match primary exactly
+        f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'orbitDirection' and att/Value eq '{pass_direction}') and "
+        # (6) sensing time window centred on expected repeat
+        f"ContentDate/Start gt {window_start} and "
+        f"ContentDate/Start lt {window_end} and "
+        # (7) spatial — must intersect the same AOI as the primary
+        f"OData.CSC.Intersects(area=geography'SRID=4326;{footprint}')"
+    )
+
+    try:
+        r = requests.get(
+            ODATA_URL,
+            params={
+                "$filter":  odata_filter,
+                "$orderby": "ContentDate/Start asc",
+                "$top":     50,
+                "$expand":  "Attributes",
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        candidates = r.json().get("value", [])
+    except Exception as e:
+        print(f"    [PRIOR] Query failed: {e}. Skipping.")
+        return None
+
+    print(f"    [PRIOR] {len(candidates)} candidate(s) after OData filters.")
+
+    valid_candidates = []  # list of (start_delta_s, duration_delta_s, cand_id)
+
+    for candidate in candidates:
+        cand_name  = candidate.get("Name", "")
+        cand_id    = cand_name.replace(".SAFE", "")
+        attrs      = candidate.get("Attributes", [])
+
+        cand_orbit = None
+        cand_slice = None
+        for attr in attrs:
+            name = attr.get("Name")
+            val  = attr.get("Value")
+            if name == "relativeOrbitNumber":
+                cand_orbit = str(val)
+            elif name == "sliceNumber":
+                cand_slice = str(val)
+
+        cand_start_str = candidate.get("ContentDate", {}).get("Start")
+        cand_end_str   = candidate.get("ContentDate", {}).get("End")
+
+        # (8) Relative orbit
+        if cand_orbit != relative_orbit:
+            print(f"    [PRIOR-REJECT] {cand_id} | orbit mismatch: {cand_orbit} != {relative_orbit}")
+            continue
+
+        # (9) Slice number
+        if cand_slice != slice_number:
+            print(f"    [PRIOR-REJECT] {cand_id} | slice mismatch: {cand_slice} != {slice_number}")
+            continue
+
+        # (10) Sensing start delta
+        if not cand_start_str:
+            print(f"    [PRIOR-REJECT] {cand_id} | no sensing start in metadata")
+            continue
+        cand_start_dt = datetime.fromisoformat(cand_start_str.replace("Z", "+00:00"))
+        start_delta_s = abs((cand_start_dt - target_dt).total_seconds())
+        if start_delta_s > MAX_SENSING_START_DELTA_S:
+            print(
+                f"    [PRIOR-REJECT] {cand_id} | sensing start delta {start_delta_s:.1f}s "
+                f"> {MAX_SENSING_START_DELTA_S}s threshold"
+            )
+            continue
+
+        # (11) Sensing duration
+        if not cand_end_str:
+            print(f"    [PRIOR-REJECT] {cand_id} | no sensing end in metadata")
+            continue
+        cand_end_dt      = datetime.fromisoformat(cand_end_str.replace("Z", "+00:00"))
+        cand_duration_s  = (cand_end_dt - cand_start_dt).total_seconds()
+        duration_delta_s = abs(cand_duration_s - primary_duration_s)
+        if duration_delta_s > MAX_SENSING_DURATION_DELTA_S:
+            print(
+                f"    [PRIOR-REJECT] {cand_id} | duration delta {duration_delta_s:.1f}s "
+                f"> {MAX_SENSING_DURATION_DELTA_S}s threshold"
+            )
+            continue
+
+        print(
+            f"    [PRIOR-PASS] {cand_id} | "
+            f"start_delta={start_delta_s:.1f}s dur_delta={duration_delta_s:.1f}s"
+        )
+        valid_candidates.append((start_delta_s, duration_delta_s, cand_id))
+
+    if not valid_candidates:
+        print(f"    [PRIOR] No valid prior acquisition found.")
+        return None
+
+    if len(valid_candidates) > 1:
+        ids = [c[2] for c in valid_candidates]
+        print(
+            f"    [PRIOR-WARN] {len(valid_candidates)} candidates passed all checks — "
+            f"likely catalog duplicates. Candidates: {ids}. Picking closest sensing time."
         )
 
-        try:
-            r = requests.get(
-                ODATA_URL,
-                params={"$filter": odata_filter, "$orderby": "ContentDate/Start asc", "$top": 50, "$expand": "Attributes"},
-                timeout=60
-            )
-            r.raise_for_status()
-            candidates = r.json().get("value", [])
-        except Exception as e:
-            print(f"    [PRIOR-{n}] Query failed: {e}. Skipping.")
+    valid_candidates.sort(key=lambda x: (x[0], x[1]))
+    best_start_delta, best_dur_delta, best_id = valid_candidates[0]
+    print(
+        f"    [PRIOR-MATCH] {best_id} | "
+        f"start_delta={best_start_delta:.1f}s dur_delta={best_dur_delta:.1f}s"
+    )
+    return best_id
+
+# ---------------------------------------------------------------------------
+# /pairs LOGIC
+# ---------------------------------------------------------------------------
+
+def pairs_logic(
+    polygon:         list,
+    start_date:      str,
+    end_date:        str | None = None,
+    exclusion_zones: list | None = None,
+) -> dict:
+    session_start = datetime.now(timezone.utc)
+    end_date      = end_date or session_start.strftime('%Y-%m-%dT%H:%M:%SZ')
+    footprint     = build_footprint(polygon)
+
+    print(f"\n{'#'*80}")
+    print(f"[PAIRS-START] Publication range: {start_date} → {end_date}")
+    print(f"[PAIRS-START] Points: {len(polygon)}")
+    print(f"{'#'*80}")
+
+    odata_filter = (
+        f"Collection/Name eq 'SENTINEL-1' and "
+        f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/Value eq 'IW_GRDH_1S') and "
+        f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'polarisationChannels' and att/Value eq 'VV&VH') and "
+        f"contains(Name,'S1A') and "
+        f"not contains(Name,'-COG') and "
+        f"PublicationDate gt {start_date} and "
+        f"PublicationDate lt {end_date} and "
+        f"OData.CSC.Intersects(area=geography'SRID=4326;{footprint}')"
+    )
+
+    if exclusion_zones:
+        odata_filter += f" and {build_exclusion_filter(exclusion_zones)}"
+        print(f"[PAIRS-EXCLUSIONS] Applying {len(exclusion_zones)} exclusion zone(s).")
+
+    all_found = query_odata_paginated(odata_filter, "PAIRS", expand="Locations")
+    print(f"[PAIRS-ODATA] Found {len(all_found)} products.")
+
+    pairs = {}
+
+    for item in all_found:
+        item_name     = item.get("Name", "")
+        item_id       = item_name.replace(".SAFE", "")
+        sensing_start = item.get("ContentDate", {}).get("Start")
+        pub_time      = item.get("PublicationDate")
+        s3_prefix     = extract_s3_prefix(item)
+
+        print(f"[PAIRS-ITEM] {item_id} | Published: {pub_time}")
+
+        if not s3_prefix:
+            print(f"  [PAIRS-SKIP] No S3 prefix. Skipping.")
             continue
 
-        match = None
-        for candidate in candidates:
-            attrs      = candidate.get("Attributes", [])
-            cand_orbit = None
-            cand_slice = None
-            for attr in attrs:
-                if attr.get("Name") == "relativeOrbitNumber":
-                    cand_orbit = str(attr.get("Value"))
-                elif attr.get("Name") == "sliceNumber":
-                    cand_slice = str(attr.get("Value"))
-            if cand_orbit == relative_orbit and cand_slice == slice_number:
-                match = candidate
-                break
-
-        if not match:
-            print(f"    [PRIOR-{n}] No match found.")
+        if not sensing_start:
+            print(f"  [PAIRS-SKIP] No sensing start in metadata. Skipping.")
             continue
 
-        match_name = match.get("Name", "")
-        match_id   = match_name.replace(".SAFE", "")
-        print(f"    [PRIOR-{n}] Matched: {match_id}")
+        attrs          = get_product_attributes(item_name)
+        relative_orbit = attrs["relative_orbit"]
+        slice_number   = attrs["slice_number"]
+        pass_direction = attrs["pass_direction"]
+        sensing_end    = attrs["sensing_end"]
 
-        s3_prefix = None
-        try:
-            r2 = requests.get(
-                ODATA_URL,
-                params={"$filter": f"Name eq '{match_name}'", "$expand": "Locations", "$top": 1},
-                timeout=30
-            )
-            r2.raise_for_status()
-            loc_items = r2.json().get("value", [])
-            if loc_items:
-                s3_prefix = extract_s3_prefix(loc_items[0])
-        except Exception as e:
-            print(f"    [PRIOR-{n}] Could not fetch S3 prefix for {match_id}: {e}")
+        if not relative_orbit or not slice_number:
+            print(f"  [PAIRS-SKIP] No orbit/slice. Skipping.")
+            continue
 
-        results.append({
-            "id":               match_id,
-            "platform":         match_name[:3],
-            "publication_date": match.get("PublicationDate"),
-            "sensing_start":    match.get("ContentDate", {}).get("Start"),
-            "sensing_end":      match.get("ContentDate", {}).get("End"),
-            "relative_orbit":   relative_orbit,
-            "slice_number":     slice_number,
-            "s3_prefix":        s3_prefix
-        })
+        if not pass_direction:
+            print(f"  [PAIRS-SKIP] No pass direction. Skipping.")
+            continue
 
-    return results
+        if not sensing_end:
+            print(f"  [PAIRS-SKIP] No sensing end. Skipping.")
+            continue
+
+        print(
+            f"  [PAIRS-ATTRS] Orbit: {relative_orbit} | Slice: {slice_number} | "
+            f"Pass: {pass_direction} | Start: {sensing_start} | End: {sensing_end}"
+        )
+
+        secondary = find_prior_acquisition(
+            relative_orbit = relative_orbit,
+            slice_number   = slice_number,
+            pass_direction = pass_direction,
+            sensing_start  = sensing_start,
+            sensing_end    = sensing_end,
+            footprint      = footprint,
+        )
+        print(f"  [PAIRS-MATCH] {'Found: ' + secondary if secondary else 'No prior acquisition found.'}")
+
+        trimmed_id = "_".join(item_id.split("_")[:-1])
+        if secondary:
+            trimmed_ref       = "_".join(secondary.split("_")[:-1])
+            pairs[trimmed_id] = [trimmed_id, trimmed_ref]
+        else:
+            pairs[trimmed_id] = [trimmed_id]
+
+    print(f"\n{'#'*80}\n[PAIRS-COMPLETE] {len(pairs)} pairs assembled.\n{'#'*80}")
+    return pairs
 
 # ---------------------------------------------------------------------------
 # S3 → GCS TRANSFER
@@ -297,83 +518,6 @@ def transfer_file(s3_key: str, gcs_path: str, bucket, file_idx: int, total_files
             else:
                 print(f"        [FILE-FAIL] gave up after {attempt} attempts | {s3_key} | {err[:200]}")
     return False
-
-# ---------------------------------------------------------------------------
-# /pairs LOGIC
-# ---------------------------------------------------------------------------
-
-def pairs_logic(
-    polygon:         list,
-    start_date:      str,
-    end_date:        str | None = None,
-    exclusion_zones: list | None = None,
-    match_count:     int = 1
-) -> dict:
-    session_start = datetime.now(timezone.utc)
-    end_date      = end_date or session_start.strftime('%Y-%m-%dT%H:%M:%SZ')
-    footprint     = build_footprint(polygon)
-
-    print(f"\n{'#'*80}")
-    print(f"[PAIRS-START] Publication range: {start_date} → {end_date}")
-    print(f"[PAIRS-START] Match count: {match_count} | Points: {len(polygon)}")
-    print(f"{'#'*80}")
-
-    odata_filter = (
-        f"Collection/Name eq 'SENTINEL-1' and "
-        f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/Value eq 'IW_GRDH_1S') and "
-        f"PublicationDate gt {start_date} and "
-        f"PublicationDate lt {end_date} and "
-        f"OData.CSC.Intersects(area=geography'SRID=4326;{footprint}')"
-    )
-
-    if exclusion_zones:
-        odata_filter += f" and {build_exclusion_filter(exclusion_zones)}"
-        print(f"[PAIRS-EXCLUSIONS] Applying {len(exclusion_zones)} exclusion zone(s).")
-
-    all_found = query_odata_paginated(odata_filter, "PAIRS", expand="Locations")
-    print(f"[PAIRS-ODATA] Found {len(all_found)} products.")
-
-    pairs = {}
-
-    for item in all_found:
-        item_name     = item.get("Name", "")
-        item_id       = item_name.replace(".SAFE", "")
-        platform      = item_name[:3]
-        sensing_start = item.get("ContentDate", {}).get("Start")
-        pub_time      = item.get("PublicationDate")
-        s3_prefix     = extract_s3_prefix(item)
-
-        print(f"[PAIRS-ITEM] {item_id} | Published: {pub_time}")
-
-        if not s3_prefix:
-            print(f"  [PAIRS-SKIP] No S3 prefix. Skipping.")
-            continue
-
-        attrs          = get_product_attributes(item_name)
-        relative_orbit = attrs["relative_orbit"]
-        slice_number   = attrs["slice_number"]
-
-        if not relative_orbit or not slice_number:
-            print(f"  [PAIRS-SKIP] No orbit/slice. Skipping.")
-            continue
-
-        print(f"  [PAIRS-ATTRS] Orbit: {relative_orbit} | Slice: {slice_number}")
-
-        references = find_prior_acquisitions(
-            platform       = platform,
-            relative_orbit = relative_orbit,
-            slice_number   = slice_number,
-            sensing_start  = sensing_start,
-            count          = match_count
-        )
-        print(f"  [PAIRS-MATCH] Found {len(references)} reference(s).")
-
-        trimmed_id        = "_".join(item_id.split("_")[:-1])
-        ref_ids           = ["_".join(r["id"].split("_")[:-1]) for r in references]
-        pairs[trimmed_id] = [trimmed_id] + ref_ids
-
-    print(f"\n{'#'*80}\n[PAIRS-COMPLETE] {len(pairs)} pairs assembled.\n{'#'*80}")
-    return pairs
 
 # ---------------------------------------------------------------------------
 # /fetch LOGIC
@@ -425,15 +569,13 @@ def fetch_logic(product_id: str, bucket_name: str) -> dict:
 @app.post("/pairs")
 def trigger_pairs(request: PairsRequest):
     print(f"\n[API-POST /pairs] {len(request.polygon)} points | "
-          f"{request.start_date} → {request.end_date or 'now'} | "
-          f"match_count={request.match_count}")
+          f"{request.start_date} → {request.end_date or 'now'}")
     try:
         return pairs_logic(
             polygon         = request.polygon,
             start_date      = request.start_date,
             end_date        = request.end_date,
             exclusion_zones = request.exclusion_zones,
-            match_count     = request.match_count
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

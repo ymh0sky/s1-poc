@@ -4,7 +4,7 @@
 gcloud auth login
 gcloud auth application-default login
 gcloud config set project mafat-ai-gee-monitor-dev
-gcloud auth configure-docker me-west1-docker.pkg.dev
+gcloud auth configure-docker europe-west1-docker.pkg.dev
 
 # ---------------------------------------------------------------------------
 # SERVICE ACCOUNTS
@@ -28,12 +28,12 @@ gcloud projects add-iam-policy-binding mafat-ai-gee-monitor-dev `
 # Service B only needs to read/check GCS (checking if product already downloaded)
 gcloud projects add-iam-policy-binding mafat-ai-gee-monitor-dev `
   --member "serviceAccount:service-b-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com" `
-  --role "roles/storage.objectViewer"
+  --role "roles/storage.objectAdmin"
 
 # Service B needs to be able to call Service A's HTTP endpoints
 # Note: run this after Service A has been deployed at least once
 gcloud run services add-iam-policy-binding service-a `
-  --region me-west1 `
+  --region europe-west1 `
   --member "serviceAccount:service-b-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com" `
   --role "roles/run.invoker" `
   --project mafat-ai-gee-monitor-dev
@@ -48,11 +48,11 @@ gcloud run services add-iam-policy-binding service-a `
 #   - Run each command from the folder containing the respective Dockerfile
 
 # Service A — run from Service_A folder
-gcloud builds submit --tag me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-a:latest `
+gcloud builds submit --tag europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-a:latest `
   --project mafat-ai-gee-monitor-dev
 
 # Service B — run from Service_B folder
-gcloud builds submit --tag me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-b:latest `
+gcloud builds submit --tag europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-b:latest `
   --project mafat-ai-gee-monitor-dev
 
 # ---------------------------------------------------------------------------
@@ -61,21 +61,21 @@ gcloud builds submit --tag me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-r
 # ---------------------------------------------------------------------------
 # Service A — run from Service_A folder
 # docker build -t service-a-local .
-# docker tag service-a-local me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-a:latest
-# docker push me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-a:latest
+# docker tag service-a-local europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-a:latest
+# docker push europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-a:latest
 
 # Service B — run from Service_B folder
 # docker build -t service-b-local .
-# docker tag service-b-local me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-b:latest
-# docker push me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-b:latest
+# docker tag service-b-local europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-b:latest
+# docker push europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-b:latest
 
 # ---------------------------------------------------------------------------
 # DEPLOY SERVICE A — Cloud Run Service (always-on HTTP endpoint)
 # ---------------------------------------------------------------------------
 gcloud run deploy service-a `
-  --image me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-a:latest `
+  --image europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-a:latest `
   --platform managed `
-  --region me-west1 `
+  --region europe-west1 `
   --timeout 3600 `
   --memory 4Gi `
   --allow-unauthenticated `
@@ -88,17 +88,21 @@ gcloud run deploy service-a `
 # ---------------------------------------------------------------------------
 # DEPLOY SERVICE B — Cloud Run Job (runs once per execution, no HTTP)
 # ---------------------------------------------------------------------------
+# Create the env file on the fly, then deploy
+@"
+PAIRS_SERVICE_URL: "https://service-a-265944711240.europe-west1.run.app"
+GCS_BUCKET_NAME: "s1-stuff"
+RUN_INTERVAL_HOURS: "24"
+POLYGON: "[[-8.2,49.8],[2.0,49.8],[2.0,60.9],[-8.2,60.9],[-8.2,49.8]]"
+"@ | Out-File -FilePath "env.yaml" -Encoding utf8
+
 gcloud run jobs create service-b `
-  --image me-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo/service-b:latest `
-  --region me-west1 `
+  --image europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/service-b:latest `
+  --region europe-west1 `
   --task-timeout 86400 `
   --memory 512Mi `
   --service-account service-b-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com `
-  --set-env-vars PAIRS_SERVICE_URL=https://service-a-265944711240.me-west1.run.app `
-  --set-env-vars GCS_BUCKET_NAME=s1-stuff `
-  --set-env-vars MATCH_COUNT=1 `
-  --set-env-vars RUN_INTERVAL_HOURS=24 `
-  --set-env-vars "POLYGON=[[34.2,31.2],[34.6,31.2],[34.6,31.6],[34.2,31.6],[34.2,31.2]]" `
+  --env-vars-file env.yaml `
   --project mafat-ai-gee-monitor-dev
 
 # To update an existing job instead of creating it, replace 'create' with 'update':
@@ -108,7 +112,7 @@ gcloud run jobs create service-b `
 # EXECUTE SERVICE B — trigger a manual run
 # ---------------------------------------------------------------------------
 gcloud run jobs execute service-b `
-  --region me-west1 `
+  --region europe-west1 `
   --project mafat-ai-gee-monitor-dev
 
 # ---------------------------------------------------------------------------

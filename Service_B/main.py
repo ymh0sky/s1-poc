@@ -15,9 +15,6 @@ PAIRS_URL = os.getenv("PAIRS_SERVICE_URL", "https://s1-pairs-265944711240.me-wes
 # GCS bucket to check for already-downloaded products
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
 
-# How many prior passes to request per product
-MATCH_COUNT = int(os.getenv("MATCH_COUNT", "1"))
-
 # Schedule interval in hours
 RUN_INTERVAL_HOURS = int(os.getenv("RUN_INTERVAL_HOURS", "24"))
 
@@ -66,7 +63,6 @@ def call_pairs(polygon: list, start_date: str, end_date: str) -> dict | None:
         "polygon":     polygon,
         "start_date":  start_date,
         "end_date":    end_date,
-        "match_count": MATCH_COUNT
     }
     print(f"[PAIRS] Calling {url} | {start_date} → {end_date}")
     try:

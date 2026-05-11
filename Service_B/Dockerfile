@@ -8,9 +8,6 @@ ENV PAIRS_SERVICE_URL="https://s1-pairs-265944711240.me-west1.run.app"
 # GCS bucket to check and download into
 ENV GCS_BUCKET_NAME="s1-stuff"
 
-# How many prior passes to request per product
-ENV MATCH_COUNT="1"
-
 # How often to run in hours (default 24)
 ENV RUN_INTERVAL_HOURS="24"
 
