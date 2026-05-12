@@ -71,13 +71,7 @@ The `-v` mount and `GOOGLE_APPLICATION_CREDENTIALS` are only needed if you are n
 docker logs -f <container_id>
 ```
 
----
 
-## Testing with a Cloud Run Job
-
-For a one-off test run without keeping a container alive, the script can be deployed as a Cloud Run Job. The job will execute one full run and exit. See `deploy.ps1` for the full command.
-
----
 
 ## GCS output structure
 
