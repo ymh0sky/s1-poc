@@ -109,7 +109,7 @@ Files are transferred in parallel using 15 worker threads with up to 5 retries p
 ## Infrastructure
 
 - **Type:** Cloud Run Service (always-on HTTP)
-- **Region:** `me-west1`
+- **Region:** `europe-west1`
 - **Memory:** 4Gi (files are streamed through memory from S3 to GCS)
 - **Timeout:** 3600s
 - **Service Account:** `s1-pairs-fetch-sa` — requires `roles/storage.objectAdmin` on the GCS bucket
@@ -127,7 +127,7 @@ docker build -t s1-pairs-fetch .
 ```bash
 gcloud run deploy s1-pairs-fetch \
   --image gcr.io/<PROJECT>/s1-pairs-fetch \
-  --region me-west1 \
+  --region europe-west1 \
   --set-env-vars CDSE_ACCESS_KEY=...,CDSE_SECRET_KEY=...,GCS_BUCKET_NAME=...
 ```
 
