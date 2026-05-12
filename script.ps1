@@ -20,15 +20,17 @@ gcloud iam service-accounts create s1-orchestrator-sa `
   --display-name "s1-orchestrator - Orchestrator" `
   --project mafat-ai-gee-monitor-dev
 
-# s1-pairs-fetch needs full object access to GCS (read + write files during transfer)
+# s1-pairs-fetch needs full storage access including bucket-level metadata
+# (get_bucket() in main.py requires storage.buckets.get, only in roles/storage.admin)
 gcloud projects add-iam-policy-binding mafat-ai-gee-monitor-dev `
   --member "serviceAccount:s1-pairs-fetch-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com" `
-  --role "roles/storage.objectAdmin"
+  --role "roles/storage.admin"
 
-# s1-orchestrator only needs to read/check GCS (checking if product already downloaded)
+# s1-orchestrator needs full storage access including bucket-level metadata
+# (roles/storage.admin covers both bucket and object permissions)
 gcloud projects add-iam-policy-binding mafat-ai-gee-monitor-dev `
   --member "serviceAccount:s1-orchestrator-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com" `
-  --role "roles/storage.objectAdmin"
+  --role "roles/storage.admin"
 
 # s1-orchestrator needs to be able to call s1-pairs-fetch's HTTP endpoints
 # Note: run this after s1-pairs-fetch has been deployed at least once
