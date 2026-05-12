@@ -2,7 +2,10 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
 
-# URL of the pairs/fetch service
+# URL of the pairs/fetch service.
+# WARNING: The default below points to a specific deployment — override this
+# at runtime via -e PAIRS_SERVICE_URL=https://<s1-pairs-fetch-url> to avoid
+# hardcoding environment-specific URLs in the image.
 ENV PAIRS_SERVICE_URL="https://s1-pairs-265944711240.me-west1.run.app"
 
 # GCS bucket to check and download into

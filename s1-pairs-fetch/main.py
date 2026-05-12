@@ -54,12 +54,24 @@ class FetchRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def build_footprint(polygon: list[list[float]]) -> str:
+    """
+    Converts a list of [lon, lat] pairs into a WKT POLYGON string suitable for
+    OData spatial filter queries (OData.CSC.Intersects).
+    Automatically closes the ring by appending the first point at the end if
+    it is not already present, as required by the WKT spec.
+    """
     coords    = polygon if polygon[0] == polygon[-1] else polygon + [polygon[0]]
     coord_str = ",".join(f"{lon} {lat}" for lon, lat in coords)
     return f"POLYGON(({coord_str}))"
 
 
 def build_exclusion_filter(exclusion_zones: list[list[list[float]]]) -> str:
+    """
+    Builds an OData filter clause that excludes products intersecting any of the
+    given polygons. Each zone is converted to a WKT footprint and negated using
+    'not OData.CSC.Intersects(...)'. All clauses are joined with 'and', so a
+    product is excluded if it overlaps even one zone.
+    """
     clauses = []
     for zone in exclusion_zones:
         footprint = build_footprint(zone)
@@ -71,6 +83,20 @@ def build_exclusion_filter(exclusion_zones: list[list[list[float]]]) -> str:
 # ---------------------------------------------------------------------------
 
 def query_odata_paginated(odata_filter: str, label: str, expand: str = "Locations") -> list:
+    """
+    Fetches all results for a given OData filter from the CDSE catalogue,
+    following @odata.nextLink pagination until exhausted.
+
+    Args:
+        odata_filter — Full OData $filter string to apply.
+        label        — Short tag used in log lines (e.g. 'PAIRS', 'PRIOR') to
+                       identify which query is being paginated.
+        expand       — OData $expand parameter; defaults to 'Locations' to
+                       include S3 path info. Pass 'Attributes' when orbit/slice
+                       metadata is needed instead.
+
+    Returns a flat list of all product items across all pages.
+    """
     all_items = []
     url       = ODATA_URL
     params    = {
@@ -160,6 +186,13 @@ def get_product_attributes(product_name: str) -> dict:
 
 
 def extract_s3_prefix(item: dict) -> str | None:
+    """
+    Extracts the S3 key prefix for a product from its OData Locations list.
+    Skips COG variants (IW_GRDH_1S-COG) — only standard GRD .SAFE paths are
+    returned. Strips the leading 'eodata/' bucket name from the path if present,
+    and ensures the result ends with a trailing slash for use as an S3 prefix.
+    Returns None if no suitable location is found.
+    """
     for loc in (item.get("Locations") or []):
         path = loc.get("S3Path") or loc.get("Path") or ""
         if path and ".SAFE" in path and "IW_GRDH_1S-COG" not in path:
@@ -245,14 +278,15 @@ def find_prior_acquisition(
       1. [OData filter]  Product type = IW_GRDH_1S
       2. [OData filter]  Polarisation = VV&VH
       3. [OData filter]  Platform     = S1A  (never mix S1A/S1B)
-      4. [OData filter]  Non-COG      (exclude IW_GRDH_1S-COG variants)
-      5. [OData filter]  Pass direction matches primary (ASCENDING/DESCENDING)
-      6. [OData filter]  Sensing start within ±PRIOR_WINDOW_MINUTES of expected repeat
-      7. [OData filter]  Spatial footprint intersects AOI
-      8. [In-memory]     Relative orbit number exact match
-      9. [In-memory]     Slice number exact match
-     10. [In-memory]     Sensing start delta ≤ MAX_SENSING_START_DELTA_S
-     11. [In-memory]     Sensing duration delta ≤ MAX_SENSING_DURATION_DELTA_S
+      4. [OData filter]  Name contains '1SDV' (exclude erroneous 1ADV catalogue entries)
+      5. [OData filter]  Non-COG      (exclude IW_GRDH_1S-COG variants)
+      6. [OData filter]  Pass direction matches primary (ASCENDING/DESCENDING)
+      7. [OData filter]  Sensing start within ±PRIOR_WINDOW_MINUTES of expected repeat
+      8. [OData filter]  Spatial footprint intersects AOI
+      9. [In-memory]     Relative orbit number exact match
+     10. [In-memory]     Slice number exact match
+     11. [In-memory]     Sensing start delta ≤ MAX_SENSING_START_DELTA_S
+     12. [In-memory]     Sensing duration delta ≤ MAX_SENSING_DURATION_DELTA_S
     """
     sensing_dt         = datetime.fromisoformat(sensing_start.replace("Z", "+00:00"))
     sensing_end_dt     = datetime.fromisoformat(sensing_end.replace("Z", "+00:00"))
@@ -276,14 +310,16 @@ def find_prior_acquisition(
         f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'polarisationChannels' and att/Value eq 'VV&VH') and "
         # (3) platform — S1A only, never mix with S1B
         f"contains(Name,'S1A') and "
-        # (4) exclude COG variants
+        # (4) SDV polarisation mode — exclude 1ADV products added to catalogue by mistake
+        f"contains(Name,'1SDV') and "
+        # (5) exclude COG variants
         f"not contains(Name,'-COG') and "
-        # (5) pass direction must match primary exactly
+        # (6) pass direction must match primary exactly
         f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'orbitDirection' and att/Value eq '{pass_direction}') and "
-        # (6) sensing time window centred on expected repeat
+        # (7) sensing time window centred on expected repeat
         f"ContentDate/Start gt {window_start} and "
         f"ContentDate/Start lt {window_end} and "
-        # (7) spatial — must intersect the same AOI as the primary
+        # (8) spatial — must intersect the same AOI as the primary
         f"OData.CSC.Intersects(area=geography'SRID=4326;{footprint}')"
     )
 
@@ -398,6 +434,21 @@ def pairs_logic(
     end_date:        str | None = None,
     exclusion_zones: list | None = None,
 ) -> dict:
+    """
+    Core logic for the /pairs endpoint. Queries the CDSE catalogue for all
+    Sentinel-1 IW_GRDH_1S VV&VH S1A products published within the given date
+    range that intersect the AOI polygon. For each product found, attempts to
+    locate one prior acquisition 12 days earlier on the identical ground track
+    (same relative orbit and slice number).
+
+    Products are skipped if they lack an S3 path, sensing timestamps, orbit/slice
+    attributes, or pass direction. Exclusion zones are applied at the OData query
+    level before any per-product processing.
+
+    Returns a dict keyed by trimmed product ID (last _XXXX segment removed).
+    Each value is a list: [primary_id] if no prior was found, or
+    [primary_id, secondary_id] if a valid prior acquisition was matched.
+    """
     session_start = datetime.now(timezone.utc)
     end_date      = end_date or session_start.strftime('%Y-%m-%dT%H:%M:%SZ')
     footprint     = build_footprint(polygon)
@@ -412,6 +463,7 @@ def pairs_logic(
         f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/Value eq 'IW_GRDH_1S') and "
         f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'polarisationChannels' and att/Value eq 'VV&VH') and "
         f"contains(Name,'S1A') and "
+        f"contains(Name,'1SDV') and "
         f"not contains(Name,'-COG') and "
         f"PublicationDate gt {start_date} and "
         f"PublicationDate lt {end_date} and "
@@ -496,6 +548,22 @@ FILE_RETRY_DELAYS = [5, 15, 30, 60, 120]
 
 
 def transfer_file(s3_key: str, gcs_path: str, bucket, file_idx: int, total_files: int) -> bool:
+    """
+    Streams a single file from CDSE S3 into GCS. The file is read directly from
+    the S3 response body and uploaded to the GCS bucket blob without writing to
+    disk — memory is the only buffer.
+
+    Retries up to FILE_MAX_RETRIES times on any exception, with delays defined
+    by FILE_RETRY_DELAYS (5s, 15s, 30s, 60s, 120s). Returns True on success,
+    False if all attempts are exhausted.
+
+    Args:
+        s3_key      — Full S3 object key within the 'eodata' bucket.
+        gcs_path    — Destination blob path within the GCS bucket.
+        bucket      — GCS bucket object (google.cloud.storage.Bucket).
+        file_idx    — 1-based index of this file, used in log output.
+        total_files — Total number of files in the transfer batch, used in logs.
+    """
     start_time = time.time()
     fname      = os.path.basename(s3_key)
     print(f"        [FILE-START] {file_idx}/{total_files} | {fname}")
@@ -524,6 +592,14 @@ def transfer_file(s3_key: str, gcs_path: str, bucket, file_idx: int, total_files
 # ---------------------------------------------------------------------------
 
 def fetch_logic(product_id: str, bucket_name: str) -> dict:
+    """
+    Core logic for the /fetch endpoint. Resolves a trimmed product ID to its
+    full name and S3 prefix via the CDSE catalogue, then lists all files under
+    that prefix and transfers them in parallel to GCS using 15 worker threads.
+
+    Returns a summary dict with transfer status ('done' or 'partial'), the full
+    product ID, file counts, and the GCS destination path.
+    """
     print(f"\n[FETCH-START] {product_id} → gs://{bucket_name}/")
 
     full_id, s3_prefix = resolve_s3_prefix_from_trimmed(product_id)
@@ -568,6 +644,11 @@ def fetch_logic(product_id: str, bucket_name: str) -> dict:
 
 @app.post("/pairs")
 def trigger_pairs(request: PairsRequest):
+    """
+    Finds Sentinel-1 products published within the requested date range that
+    intersect the given AOI, and pairs each with its prior acquisition 12 days
+    earlier. See pairs_logic() for full matching behaviour.
+    """
     print(f"\n[API-POST /pairs] {len(request.polygon)} points | "
           f"{request.start_date} → {request.end_date or 'now'}")
     try:
@@ -583,10 +664,16 @@ def trigger_pairs(request: PairsRequest):
 
 @app.post("/fetch")
 def trigger_fetch(request: FetchRequest):
+    """
+    Downloads a single Sentinel-1 product from CDSE S3 and transfers it to GCS.
+    Accepts a trimmed product ID (as returned by /pairs). See fetch_logic() for
+    full transfer behaviour including retry schedule and parallelism.
+    """
     print(f"\n[API-POST /fetch] {request.product_id} → {request.bucket_name}")
     return fetch_logic(request.product_id, request.bucket_name)
 
 
 @app.get("/")
 def health():
+    """Health check. Returns service status and current UTC time."""
     return {"status": "online", "time": datetime.now(timezone.utc)}

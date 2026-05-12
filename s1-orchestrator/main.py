@@ -29,6 +29,12 @@ DEFAULT_POLYGON = [
 ]
 
 def get_polygon() -> list:
+    """
+    Returns the AOI polygon to use for this run. If the POLYGON environment
+    variable is set, it is parsed as a JSON array of [lon, lat] pairs and used
+    instead of the hardcoded default. Falls back to DEFAULT_POLYGON if the env
+    var is absent or cannot be parsed.
+    """
     raw = os.getenv("POLYGON")
     if raw:
         try:
@@ -58,6 +64,12 @@ def product_already_downloaded(bucket, product_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def call_pairs(polygon: list, start_date: str, end_date: str) -> dict | None:
+    """
+    Calls the /pairs endpoint on s1-pairs-fetch with the given polygon and date range.
+    Returns the full pairs dict (keyed by trimmed primary product ID) on success,
+    or None if the request fails or returns an error. Timeout is set to 3600s to
+    accommodate large AOIs with many products.
+    """
     url = f"{PAIRS_URL}/pairs"
     payload = {
         "polygon":     polygon,
@@ -77,6 +89,12 @@ def call_pairs(polygon: list, start_date: str, end_date: str) -> dict | None:
 
 
 def call_fetch(product_id: str) -> bool:
+    """
+    Calls the /fetch endpoint on s1-pairs-fetch to download a single product from
+    CDSE S3 into GCS. Accepts a trimmed product ID (as returned by /pairs).
+    Returns True if s1-pairs-fetch reports status 'done', False on any error or
+    partial transfer. Timeout is set to 3600s to accommodate large products.
+    """
     url     = f"{PAIRS_URL}/fetch"
     payload = {"product_id": product_id}
     print(f"  [FETCH] Calling /fetch for {product_id}")
@@ -96,6 +114,16 @@ def call_fetch(product_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def run():
+    """
+    Executes one full orchestration cycle:
+      1. Builds a lookback window of RUN_INTERVAL_HOURS ending at the current UTC time.
+      2. Calls s1-pairs-fetch /pairs to discover all Sentinel-1 products in that window.
+      3. For each product ID in every pair list, checks GCS to see if it is already
+         downloaded. Skips it if found, otherwise calls s1-pairs-fetch /fetch to download it.
+      4. Prints a summary of checked / skipped / fetched / failed counts.
+
+    Failures on individual fetches are logged but do not abort the rest of the run.
+    """
     now        = datetime.now(timezone.utc)
     end_date   = now.strftime('%Y-%m-%dT%H:%M:%SZ')
     start_date = (now - timedelta(hours=RUN_INTERVAL_HOURS)).strftime('%Y-%m-%dT%H:%M:%SZ')
