@@ -90,7 +90,12 @@ gcloud run deploy s1-pairs-fetch `
 # ---------------------------------------------------------------------------
 # DEPLOY s1-orchestrator — Cloud Run Job (runs once per execution, no HTTP)
 # ---------------------------------------------------------------------------
-# Create the env file on the fly, then deploy
+# ⚠️  PATCH ONLY — max-retries is set high here to work around the Cloud Run
+#     86400s task timeout killing the process after each 24h sleep cycle.
+#     The correct fix is to remove the sleep loop from main.py, have the job
+#     exit after a single run(), and trigger it externally via Cloud Scheduler.
+#     Until that refactor is done, each retry = one extra day of operation.
+
 @"
 PAIRS_SERVICE_URL: "https://s1-pairs-fetch-265944711240.europe-west1.run.app"
 GCS_BUCKET_NAME: "s1-stuff"
@@ -102,13 +107,22 @@ gcloud run jobs create s1-orchestrator `
   --image europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/s1-orchestrator:latest `
   --region europe-west1 `
   --task-timeout 86400 `
+  --max-retries 10 `
   --memory 512Mi `
   --service-account s1-orchestrator-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com `
   --env-vars-file env.yaml `
   --project mafat-ai-gee-monitor-dev
 
 # To update an existing job instead of creating it, replace 'create' with 'update':
-# gcloud run jobs update s1-orchestrator ...
+gcloud run jobs update s1-orchestrator `
+  --image europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/s1-orchestrator:latest `
+  --region europe-west1 `
+  --task-timeout 86400 `
+  --max-retries 10 `
+  --memory 512Mi `
+  --service-account s1-orchestrator-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com `
+  --env-vars-file env.yaml `
+  --project mafat-ai-gee-monitor-dev
 
 # ---------------------------------------------------------------------------
 # EXECUTE s1-orchestrator — trigger a manual run
