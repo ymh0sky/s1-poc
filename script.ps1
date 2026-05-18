@@ -88,47 +88,23 @@ gcloud run deploy s1-pairs-fetch `
   --project mafat-ai-gee-monitor-dev
 
 # ---------------------------------------------------------------------------
-# DEPLOY s1-orchestrator — Cloud Run Job (runs once per execution, no HTTP)
+# DEPLOY s1-orchestrator — Cloud Run Service (always-on, background scheduler)
 # ---------------------------------------------------------------------------
-# ⚠️  PATCH ONLY — max-retries is set high here to work around the Cloud Run
-#     86400s task timeout killing the process after each 24h sleep cycle.
-#     The correct fix is to remove the sleep loop from main.py, have the job
-#     exit after a single run(), and trigger it externally via Cloud Scheduler.
-#     Until that refactor is done, each retry = one extra day of operation.
-
-@"
-PAIRS_SERVICE_URL: "https://s1-pairs-fetch-265944711240.europe-west1.run.app"
-GCS_BUCKET_NAME: "s1-stuff"
-RUN_INTERVAL_HOURS: "24"
-POLYGON: "[[-8.2,49.8],[2.0,49.8],[2.0,60.9],[-8.2,60.9],[-8.2,49.8]]"
-"@ | Out-File -FilePath "env.yaml" -Encoding utf8
-
-gcloud run jobs create s1-orchestrator `
+# min-instances 1 keeps one instance alive permanently so the scheduler loop
+# runs continuously. max-instances 1 prevents a second instance from spinning
+# up and double-fetching products. no-allow-unauthenticated because this
+# service exposes no public API — the health check is for Cloud Run only.
+gcloud run deploy s1-orchestrator `
   --image europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/s1-orchestrator:latest `
+  --platform managed `
   --region europe-west1 `
-  --task-timeout 86400 `
-  --max-retries 10 `
+  --min-instances 1 `
+  --max-instances 1 `
+  --no-cpu-throttling `
   --memory 512Mi `
+  --no-allow-unauthenticated `
   --service-account s1-orchestrator-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com `
   --env-vars-file env.yaml `
-  --project mafat-ai-gee-monitor-dev
-
-# To update an existing job instead of creating it, replace 'create' with 'update':
-gcloud run jobs update s1-orchestrator `
-  --image europe-west1-docker.pkg.dev/mafat-ai-gee-monitor-dev/s1-repo-europe/s1-orchestrator:latest `
-  --region europe-west1 `
-  --task-timeout 86400 `
-  --max-retries 10 `
-  --memory 512Mi `
-  --service-account s1-orchestrator-sa@mafat-ai-gee-monitor-dev.iam.gserviceaccount.com `
-  --env-vars-file env.yaml `
-  --project mafat-ai-gee-monitor-dev
-
-# ---------------------------------------------------------------------------
-# EXECUTE s1-orchestrator — trigger a manual run
-# ---------------------------------------------------------------------------
-gcloud run jobs execute s1-orchestrator `
-  --region europe-west1 `
   --project mafat-ai-gee-monitor-dev
 
 # ---------------------------------------------------------------------------
@@ -142,7 +118,7 @@ gcloud logging read "resource.type=cloud_run_revision AND resource.labels.servic
   --format "value(textPayload)"
 
 # s1-orchestrator
-gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=s1-orchestrator" `
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=s1-orchestrator" `
   --project mafat-ai-gee-monitor-dev `
   --limit 50 `
   --format "value(textPayload)"

@@ -1,2 +1,4 @@
 requests
 google-cloud-storage
+fastapi
+uvicorn

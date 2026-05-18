@@ -1,9 +1,20 @@
+import threading
 import time
 from datetime import datetime, timezone, timedelta
+from fastapi import FastAPI
 from google.cloud import storage
 from config import GCS_BUCKET_NAME, RUN_INTERVAL_HOURS, get_polygon
 from gcs import product_already_downloaded
 from service import call_pairs, call_fetch
+
+app = FastAPI()
+
+
+@app.get("/")
+def health():
+    """Health check. Returns service status and current UTC time."""
+    return {"status": "online", "time": datetime.now(timezone.utc)}
+
 
 # ---------------------------------------------------------------------------
 # MAIN RUN LOGIC
@@ -31,16 +42,13 @@ def run():
     print(f"[RUN-START] Bucket: {GCS_BUCKET_NAME}")
     print(f"{'#'*80}")
 
-    # --- STEP 1: Get pairs ---
     pairs = call_pairs(polygon, start_date, end_date)
     if not pairs:
         print("[RUN] No pairs returned or call failed. Exiting run.")
         return
 
-    # --- STEP 2: Connect to GCS ---
     bucket = storage.Client().get_bucket(GCS_BUCKET_NAME)
 
-    # --- STEP 3: For each product, check and fetch all ids in its list ---
     total_checked = 0
     total_skipped = 0
     total_fetched = 0
@@ -72,11 +80,17 @@ def run():
           f"Failed: {total_failed}")
     print(f"{'#'*80}\n")
 
+
 # ---------------------------------------------------------------------------
 # SCHEDULER LOOP
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def scheduler_loop():
+    """
+    Runs in a background thread. Calls run() on a fixed interval, sleeping
+    for the remainder of the interval after each run completes. If a run takes
+    longer than the interval the next run starts immediately.
+    """
     print(f"[SCHEDULER] Starting. Run interval: every {RUN_INTERVAL_HOURS}h")
     while True:
         run_start = time.time()
@@ -91,3 +105,10 @@ if __name__ == "__main__":
         print(f"[SCHEDULER] Run took {elapsed:.0f}s. Sleeping {sleep_for:.0f}s. "
               f"Next run at {next_run.strftime('%Y-%m-%dT%H:%M:%SZ')}")
         time.sleep(sleep_for)
+
+
+@app.on_event("startup")
+def start_scheduler():
+    """Launches the scheduler loop in a daemon thread on service startup."""
+    thread = threading.Thread(target=scheduler_loop, daemon=True)
+    thread.start()

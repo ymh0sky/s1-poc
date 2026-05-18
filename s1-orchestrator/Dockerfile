@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 # WARNING: The default below points to a specific deployment — override this
 # at runtime via -e PAIRS_SERVICE_URL=https://<s1-pairs-fetch-url> to avoid
 # hardcoding environment-specific URLs in the image.
-ENV PAIRS_SERVICE_URL="https://s1-pairs-265944711240.me-west1.run.app"
+ENV PAIRS_SERVICE_URL="https://s1-pairs-fetch-265944711240.europe-west1.run.app"
 
 # GCS bucket to check and download into
 ENV GCS_BUCKET_NAME="s1-stuff"
@@ -23,6 +23,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py .
+COPY *.py ./
 
-CMD ["python", "main.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
